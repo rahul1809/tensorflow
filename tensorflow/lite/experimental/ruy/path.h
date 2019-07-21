@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <cstdint>
 
+#include "tensorflow/lite/experimental/ruy/platform.h"
 #include "tensorflow/lite/experimental/ruy/size_util.h"
 
 namespace ruy {
@@ -87,18 +88,33 @@ inline constexpr Path operator^(Path p, Path q) {
                            static_cast<std::uint32_t>(q));
 }
 
+inline constexpr Path operator~(Path p) {
+  return static_cast<Path>(~static_cast<std::uint32_t>(p));
+}
+
 inline Path GetMostSignificantPath(Path path_mask) {
   return static_cast<Path>(round_down_pot(static_cast<int>(path_mask)));
 }
 
 // ruy::kAllPaths represents all Path's that make sense to on a given
 // base architecture.
-#ifdef __aarch64__
+#ifdef __linux__
+#if RUY_PLATFORM(NEON_64)
 constexpr Path kAllPaths =
     Path::kReference | Path::kStandardCpp | Path::kNeon | Path::kNeonDotprod;
+#elif RUY_PLATFORM(NEON_32)
+constexpr Path kAllPaths = Path::kReference | Path::kStandardCpp | Path::kNeon;
 #else
 constexpr Path kAllPaths = Path::kReference | Path::kStandardCpp;
 #endif
+#else   // __linux__
+// We don't know how to do runtime dotprod detection outside of linux for now.
+#if RUY_PLATFORM(NEON)
+constexpr Path kAllPaths = Path::kReference | Path::kStandardCpp | Path::kNeon;
+#else
+constexpr Path kAllPaths = Path::kReference | Path::kStandardCpp;
+#endif
+#endif  // __linux__
 
 }  // namespace ruy
 

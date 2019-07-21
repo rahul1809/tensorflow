@@ -13,14 +13,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "tensorflow/compiler/xla/service/gpu/ir_emitter_unnested.h"
+
 #include <algorithm>
 #include <cstring>
 #include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
-
-#include "tensorflow/compiler/xla/service/gpu/ir_emitter_unnested.h"
 
 #include "absl/algorithm/container.h"
 #include "absl/memory/memory.h"
@@ -37,14 +37,18 @@ limitations under the License.
 #include "tensorflow/compiler/xla/layout_util.h"
 #include "tensorflow/compiler/xla/literal.h"
 #include "tensorflow/compiler/xla/service/buffer_assignment.h"
+#include "tensorflow/compiler/xla/service/custom_call_target_registry.h"
 #include "tensorflow/compiler/xla/service/dfs_hlo_visitor.h"
+#include "tensorflow/compiler/xla/service/gpu/backend_configs.pb.h"
 #include "tensorflow/compiler/xla/service/gpu/buffer_allocations.h"
 #include "tensorflow/compiler/xla/service/gpu/cholesky_thunk.h"
+#include "tensorflow/compiler/xla/service/gpu/collective_permute_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/conditional_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/convolution_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/copy_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/cudnn_batchnorm_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/cudnn_conv_runner.h"
+#include "tensorflow/compiler/xla/service/gpu/custom_call_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/fft_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/for_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/gemm_thunk.h"
@@ -59,6 +63,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/gpu/outfeed_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/parallel_loop_emitter.h"
 #include "tensorflow/compiler/xla/service/gpu/partition_assignment.h"
+#include "tensorflow/compiler/xla/service/gpu/replica_id_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/sequential_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/target_util.h"
 #include "tensorflow/compiler/xla/service/gpu/thunk.h"
@@ -132,14 +137,6 @@ bool ReachRootViaOnlyTuples(const HloInstruction& hlo,
   }
 
   return true;
-}
-
-// If `hlo` is a Transpose, returns its operand; otherwise returns `hlo` itself.
-const HloInstruction* StripTranspose(const HloInstruction& hlo) {
-  if (hlo.IsRank2Transpose()) {
-    return hlo.operand(0);
-  }
-  return &hlo;
 }
 
 // Updates the launch dimensions in "thunk" and annotate the launch dimensions
@@ -236,17 +233,10 @@ llvm::Function* IrEmitterUnnested::BuildKernelPrototype(
     }
   }
 
+  AnnotateFunctionAsGpuKernel(module, kernel, &b_);
+
   // TODO(b/65380986): Investigate if adding fast math flags for generated
   // kernels makes sense.
-
-  // Add the declaration of this kernel to llvm.nvvm.annotations so that NVPTX
-  // treats it as a CUDA kernel.
-  llvm::NamedMDNode* nvvm_annotations_node =
-      module->getOrInsertNamedMetadata("nvvm.annotations");
-  nvvm_annotations_node->addOperand(llvm::MDNode::get(
-      context, {llvm::ConstantAsMetadata::get(kernel),
-                llvm::MDString::get(context, "kernel"),
-                llvm::ConstantAsMetadata::get(b_.getInt32(1))}));
 
   // Update the insert point to the entry basic block.
   llvm::BasicBlock* entry_bb =
@@ -351,10 +341,6 @@ Status IrEmitterUnnested::DefaultAction(HloInstruction* hlo) {
 }
 
 Status IrEmitterUnnested::HandleDot(HloInstruction* dot) {
-  if (ImplementedAsGemm(*dot)) {
-    AddThunkToThunkSequence(BuildGemmThunk(dot));
-    return Status::OK();
-  }
   AddThunkToThunkSequence(
       BuildKernelThunk(dot, /*implements_whole_instruction=*/true));
   return IrEmitter::HandleDot(dot);
@@ -527,7 +513,40 @@ Status IrEmitterUnnested::HandleCustomCall(HloInstruction* custom_call) {
     return Status::OK();
   }
 
-  return IrEmitter::HandleCustomCall(custom_call);
+  if (IsCublasGemm(*custom_call)) {
+    AddThunkToThunkSequence(BuildGemmThunk(custom_call));
+    return Status::OK();
+  }
+
+  if (void* call_target = CustomCallTargetRegistry::Global()->Lookup(
+          custom_call->custom_call_target(),
+          ir_emitter_context_->platform()->Name())) {
+    const auto& assn = ir_emitter_context_->buffer_assignment();
+    auto get_slices_for_instr = [&](const HloInstruction* instr) {
+      ShapeTree<BufferAllocation::Slice> slices(instr->shape());
+      slices.ForEachMutableElement([&](const ShapeIndex& index,
+                                       BufferAllocation::Slice* slice) {
+        StatusOr<BufferAllocation::Slice> s = assn.GetUniqueSlice(instr, index);
+        if (s.ok()) {
+          *slice = s.ValueOrDie();
+        }
+      });
+      return slices;
+    };
+    std::vector<ShapeTree<BufferAllocation::Slice>> operand_slices;
+    for (const auto* operand : custom_call->operands()) {
+      operand_slices.push_back(get_slices_for_instr(operand));
+    }
+    ShapeTree<BufferAllocation::Slice> result_slices =
+        get_slices_for_instr(custom_call);
+    AddThunkToThunkSequence(absl::make_unique<CustomCallThunk>(
+        call_target, std::move(operand_slices), std::move(result_slices),
+        Cast<HloCustomCallInstruction>(custom_call)->opaque(), custom_call));
+    return Status::OK();
+  }
+
+  return Unimplemented("No registered implementation for custom call to \"%s\"",
+                       custom_call->custom_call_target());
 }
 
 Status IrEmitterUnnested::HandleFft(HloInstruction* fft) {
@@ -672,11 +691,6 @@ Status IrEmitterUnnested::HandleFusion(HloInstruction* fusion) {
     return llvm_ir::EmitParallelFusedDynamicUpdateSliceInPlace(
         fusion, GetGeneratorForOperandIrArrays(fusion), output_array,
         &elemental_emitter, launch_dimensions, &b_);
-  }
-
-  if (ImplementedAsGemm(*fusion)) {
-    AddThunkToThunkSequence(BuildGemmThunk(fusion));
-    return Status::OK();
   }
 
   CHECK_EQ(fusion->fusion_kind(), HloInstruction::FusionKind::kLoop)
@@ -992,37 +1006,30 @@ Status IrEmitterUnnested::HandleWhile(HloInstruction* xla_while) {
 }
 
 Status IrEmitterUnnested::HandleRng(HloInstruction* rng) {
-  // Build the kernel to generate the random numbers.
-  //
-  // Unroll the kernel so that the duplicated computation that calculates the
-  // 128 bit sample can be optimized away by LLVM.
-  std::unique_ptr<KernelThunk> rng_thunk = BuildKernelThunk(
-      rng, /*implements_whole_instruction=*/false, ComputeMaxUnrollFactor(rng));
-  ElementalIrEmitter::HloToElementGeneratorMap operand_to_generator;
-  for (const HloInstruction* operand : rng->operands()) {
-    operand_to_generator[operand] = [=](const llvm_ir::IrArray::Index& index) {
-      return GetIrArray(*operand, *rng).EmitReadArrayElement(index, &b_);
-    };
-  }
-  TF_RETURN_IF_ERROR(EmitTargetElementLoopInThunk(
-      *rng,
-      GpuElementalIrEmitter(hlo_module_config_, module_, &b_,
-                            GetNestedComputer())
-          .MakeElementGenerator(rng, operand_to_generator),
-      rng_thunk.get()));
+  return Unimplemented("Rng should be expanded for GPU.");
+}
 
+Status IrEmitterUnnested::HandleRngGetAndUpdateState(
+    HloInstruction* rng_state) {
   // Emit a kernel to increment the global state for Philox RNG algorithm.
-  std::unique_ptr<Thunk> increment_seed_thunk =
-      BuildKernelThunk(rng, /*implements_whole_instruction=*/false);
-  llvm_ir::IncrementVariableForPhiloxRngState(1, module_, &b_);
-
-  // Build the SequentialThunk for the RNG hlo.
-  std::vector<std::unique_ptr<Thunk>> thunks;
-  thunks.reserve(2);
-  thunks.push_back(std::move(rng_thunk));
-  thunks.push_back(std::move(increment_seed_thunk));
   AddThunkToThunkSequence(
-      absl::make_unique<SequentialThunk>(std::move(thunks), rng));
+      BuildKernelThunk(rng_state, /*implements_whole_instruction=*/true));
+
+  llvm::Value* old_state = llvm_ir::RngGetAndUpdateState(
+      Cast<HloRngGetAndUpdateStateInstruction>(rng_state)->delta(), module_,
+      &b_);
+
+  llvm::Value* output_address =
+      GetIrArray(*rng_state, *rng_state)
+          .EmitArrayElementAddress(
+              llvm_ir::IrArray::Index(
+                  /*linear=*/b_.getInt64(0), rng_state->shape(), &b_),
+              &b_, "rng_state_address");
+  output_address = BitCast(
+      output_address, llvm::PointerType::get(
+                          old_state->getType(),
+                          output_address->getType()->getPointerAddressSpace()));
+  Store(old_state, output_address);
 
   return Status::OK();
 }
@@ -1375,6 +1382,18 @@ Status IrEmitterUnnested::HandleTupleSelect(HloInstruction* tuple_select) {
   AddThunkToThunkSequence(
       BuildKernelThunk(tuple_select, /*implements_whole_instruction=*/true));
   return IrEmitter::HandleTupleSelect(tuple_select);
+}
+
+Status IrEmitterUnnested::HandleReplicaId(HloInstruction* hlo) {
+  AddThunkToThunkSequence(
+      absl::make_unique<ReplicaIdThunk>(GetAllocationSlice(*hlo), hlo));
+  return Status::OK();
+}
+
+Status IrEmitterUnnested::HandleCollectivePermute(HloInstruction* hlo) {
+  AddThunkToThunkSequence(absl::make_unique<CollectivePermuteThunk>(
+      GetAllocationSlice(*hlo->operand(0)), GetAllocationSlice(*hlo), hlo));
+  return Status::OK();
 }
 
 namespace {
@@ -1757,88 +1776,20 @@ std::unique_ptr<Thunk> IrEmitterUnnested::BuildOutfeedThunk(
   return absl::make_unique<OutfeedThunk>(std::move(slices), inst);
 }
 
-namespace {
-double GetScalarConstantAsDouble(const Literal& literal) {
-  switch (literal.shape().element_type()) {
-    case F16:
-      return static_cast<double>(literal.Get<Eigen::half>({}));
-    case F32:
-      return literal.Get<float>({});
-    case F64:
-      return literal.Get<double>({});
-    default:
-      LOG(FATAL) << "Unsupported type.";
-  }
-}
-}  // namespace
-
 std::unique_ptr<Thunk> IrEmitterUnnested::BuildGemmThunk(
     const HloInstruction* inst) {
-  if (inst->opcode() == HloOpcode::kDot) {
-    const HloInstruction* lhs = inst->operand(0);
-    const HloInstruction* rhs = inst->operand(1);
-    return absl::make_unique<GemmThunk>(
-        GetAllocationSlice(*lhs),   // The buffer assigned to LHS.
-        GetAllocationSlice(*rhs),   // The buffer assigned to RHS.
-        GetAllocationSlice(*inst),  // The output buffer.
-        lhs->shape(),               // The shape of LHS.
-        rhs->shape(),               // The shape of RHS.
-        inst->shape(),              // The shape of the output.
-        1.0,                        // alpha.
-        0.0,                        // beta.
-        inst, /*implements_whole_instruction=*/true);
-  }
+  auto config_or = inst->backend_config<GemmBackendConfig>();
+  GemmBackendConfig gemm_config = std::move(config_or.ValueOrDie());
+  const HloInstruction* lhs = inst->operand(0);
+  const HloInstruction* rhs = inst->operand(1);
 
-  if (inst->opcode() == HloOpcode::kFusion) {
-    CHECK_EQ(inst->fusion_kind(), HloInstruction::FusionKind::kOutput);
-    const HloInstruction* output_fused_op = inst->fused_expression_root();
-
-    double alpha_value = 1.0;
-    const HloInstruction* bias = nullptr;
-    const HloInstruction* dot = output_fused_op->operand(0);
-    if (output_fused_op->opcode() == HloOpcode::kMultiply) {
-      const HloInstruction* alpha = output_fused_op->operand(1);
-      if (dot->opcode() != HloOpcode::kDot) {
-        std::swap(dot, alpha);
-      }
-      if (alpha->opcode() == HloOpcode::kBroadcast) {
-        alpha = alpha->operand(0);
-      }
-      if (alpha->opcode() == HloOpcode::kParameter) {
-        alpha = inst->operand(alpha->parameter_number());
-      }
-      // TODO(b/74185543): Remove the following if block once we support fusion
-      // with a non-constant as well. Then we will just always use the constant
-      // on the device.
-      if (alpha->opcode() == HloOpcode::kCopy) {
-        alpha = alpha->operand(0);
-      }
-      alpha_value = GetScalarConstantAsDouble(alpha->literal());
-    } else {
-      // Fused bias add.
-      CHECK_EQ(output_fused_op->opcode(), HloOpcode::kAdd);
-      bias = output_fused_op->operand(1);
-      if (dot->opcode() != HloOpcode::kDot) {
-        std::swap(dot, bias);
-      }
-      bias = inst->operand(bias->parameter_number());
-    }
-
-    DCHECK(dot->opcode() == HloOpcode::kDot);
-    const HloInstruction* lhs_parameter = StripTranspose(*dot->operand(0));
-    const HloInstruction* rhs_parameter = StripTranspose(*dot->operand(1));
-    DCHECK(lhs_parameter->opcode() == HloOpcode::kParameter &&
-           rhs_parameter->opcode() == HloOpcode::kParameter);
-    const HloInstruction* lhs =
-        inst->operand(lhs_parameter->parameter_number());
-    const HloInstruction* rhs =
-        inst->operand(rhs_parameter->parameter_number());
-
-    // The bias is passed inside the output buffer. If those buffers are shared
-    // we can just use it, otherwise copy the bias values into the output buffer
-    // first.
-    if (bias != nullptr &&
-        GetAllocationSlice(*bias) != GetAllocationSlice(*inst)) {
+  // The bias is passed inside the output buffer. If those buffers are shared
+  // we can just use it, otherwise copy the bias values into the output buffer
+  // first.
+  if (gemm_config.beta() != 0.0) {
+    const HloInstruction* bias = inst->operand(2);
+    CHECK_EQ(bias->shape(), inst->shape());
+    if (GetAllocationSlice(*bias) != GetAllocationSlice(*inst)) {
       std::vector<std::unique_ptr<Thunk>> thunks;
       thunks.push_back(absl::make_unique<DeviceToDeviceCopyThunk>(
           /*source_buffer=*/GetAllocationSlice(*bias),
@@ -1848,27 +1799,16 @@ std::unique_ptr<Thunk> IrEmitterUnnested::BuildGemmThunk(
           GetAllocationSlice(*lhs),   // The buffer assigned to LHS.
           GetAllocationSlice(*rhs),   // The buffer assigned to RHS.
           GetAllocationSlice(*inst),  // The output buffer.
-          lhs->shape(),               // The shape of LHS.
-          rhs->shape(),               // The shape of RHS.
-          inst->shape(),              // The shape of the output.
-          alpha_value,                // alpha.
-          1.0,                        // beta.
-          inst, /*implements_whole_instruction=*/false));
+          /*implements_whole_instruction=*/false, inst));
       return absl::make_unique<SequentialThunk>(std::move(thunks), inst);
     }
-    return absl::make_unique<GemmThunk>(
-        GetAllocationSlice(*lhs),     // The buffer assigned to LHS.
-        GetAllocationSlice(*rhs),     // The buffer assigned to RHS.
-        GetAllocationSlice(*inst),    // The output buffer.
-        lhs->shape(),                 // The shape of LHS.
-        rhs->shape(),                 // The shape of RHS.
-        inst->shape(),                // The shape of the output.
-        alpha_value,                  // alpha.
-        bias != nullptr ? 1.0 : 0.0,  // beta.
-        inst, /*implements_whole_instruction=*/true);
   }
 
-  LOG(FATAL) << "Cannot build a GemmThunk for " << inst->ToString();
+  return absl::make_unique<GemmThunk>(
+      GetAllocationSlice(*lhs),   // The buffer assigned to LHS.
+      GetAllocationSlice(*rhs),   // The buffer assigned to RHS.
+      GetAllocationSlice(*inst),  // The output buffer.
+      /*implements_whole_instruction=*/true, inst);
 }
 
 std::unique_ptr<Thunk> IrEmitterUnnested::BuildFftThunk(
@@ -2660,8 +2600,7 @@ void IrEmitterUnnested::EmitPrologueForOneReduction(
     HloInstruction* unnested_hlo, HloInstruction* reduce_inst, int reduce_idx,
     KernelCodegenInfo* kernel_info, GpuElementalIrEmitter* elemental_emitter,
     ShapeIndex output_shape_index) {
-  ReductionCodegenInfo* reduction_info =
-      static_cast<ReductionCodegenInfo*>(kernel_info);
+  auto reduction_info = static_cast<ReductionCodegenInfo*>(kernel_info);
 
   InlinedVector<HloComputation*, 1>* reducers =
       reduction_info->GetMutableReducers();
@@ -2720,8 +2659,7 @@ void IrEmitterUnnested::EmitPrologueForReduction(
                                         : unnested_hlo;
   absl::Span<HloInstruction* const> output_instructions =
       GetOutputInstructions(&reduce_or_tuple);
-  ReductionCodegenInfo* reduction_info =
-      static_cast<ReductionCodegenInfo*>(kernel_info);
+  auto reduction_info = static_cast<ReductionCodegenInfo*>(kernel_info);
   GpuElementalIrEmitter elemental_emitter(hlo_module_config_,
                                           ir_emitter_context_->llvm_module(),
                                           &b_, GetNestedComputer());
@@ -2794,8 +2732,7 @@ void IrEmitterUnnested::EmitFullWarpShuffleDownLoopForAllReduces(
 
 void IrEmitterUnnested::EmitEpilogueForReduction(
     HloInstruction* unnested_hlo, KernelCodegenInfo* kernel_info) {
-  ReductionCodegenInfo* reduction_info =
-      static_cast<ReductionCodegenInfo*>(kernel_info);
+  auto reduction_info = static_cast<ReductionCodegenInfo*>(kernel_info);
   int num_reduces = reduction_info->GetNumberOfReduces();
   absl::Span<llvm::AllocaInst* const> partial_result_addresses =
       reduction_info->GetPartialResultAddresses();
@@ -2910,8 +2847,7 @@ void IrEmitterUnnested::EmitTileElementForReduction(
   tiled_param_info->set_x(x_loc);
 
   // Record the untransposed output linear address for the reduction.
-  const ReductionCodegenInfo* reduction_info =
-      dynamic_cast<const ReductionCodegenInfo*>(kernel_info);
+  auto reduction_info = dynamic_cast<const ReductionCodegenInfo*>(kernel_info);
   int partial_result_index = reduction_info->IsRowReduction() ? 0 : x_iter_num;
   Store(reduction_info->GetUntransposedOutputLinearAddress(&b_, index),
         InBoundsGEP(reduction_info->GetCurrentOutputLinearIndexAddress(),
@@ -3096,11 +3032,15 @@ void IrEmitterUnnested::EmitBlock(const TileGenerator& emit_one_tile,
 
 // Emits a kernel for the hlo instruction using the given kernel mapping scheme.
 //
+// The emitted code is written into the member variable b_, which corresponds to
+// the kernel thunk currently being constructed (previous call to
+// BuildKernelThunk).
+//
 // unnested_hlo: The unnested hlo instruction for which the kernel is generated.
 //   Currently, these hlo instructions are supported: kLoop fusion, kCopy.
 // tiled_param_ids: The IDs for the parameters that are 0-2-1 transpose of
 //   other tensors with the same dimensions and are safe to be tranposed via
-//   the shared memory tranpose implementation.
+//   the shared memory transpose implementation.
 // mapping_scheme: The tiling scheme to use.
 // kernel_generator: Contains function objects for code generation, such as
 //   element generator, block prologue and epilogue generators.
@@ -3127,14 +3067,12 @@ LaunchDimensions IrEmitterUnnested::EmitKernel(
             << llvm_ir::DumpToString(*param_shmem_buffers[id]);
   }
 
-  const ReductionCodegenInfo* reduction_info =
-      dynamic_cast<const ReductionCodegenInfo*>(kernel_info);
+  auto reduction_info = dynamic_cast<const ReductionCodegenInfo*>(kernel_info);
   bool is_column_reduction =
       (reduction_info && !reduction_info->IsRowReduction());
 
-  LaunchDimensions launch_dimensions =
-      LaunchDimensions(mapping_scheme->GetNumberOfBlocks(),
-                       mapping_scheme->GetThreadsPerBlock());
+  LaunchDimensions launch_dimensions(mapping_scheme->GetNumberOfBlocks(),
+                                     mapping_scheme->GetThreadsPerBlock());
 
   // TODO(b/110211620): Enable int32 index type for column reduction.
   llvm::Type* index_ty =
@@ -3274,7 +3212,7 @@ LaunchDimensions IrEmitterUnnested::EmitKernel(
 // algorithm to improve the memory access patterns for the input parameters
 // with a shape that is a 0-2-1 transpose of the output tensor shape. The caller
 // is responsible for making sure that it is safe to apply the shared memory
-// tranpose on the input parameters.
+// transpose on the input parameters.
 //
 //
 // For the purpose of tiling, the output tensors have a logical shape of three
@@ -3342,7 +3280,7 @@ namespace {
 // the preload tile. If this is not true, we can't use a shmem transpose for P.
 //
 // If the computation of output element [z, y, x] only requires the element of
-// P with the same indices, the shmem tranpose implementation can be applied
+// P with the same indices, the shmem transpose implementation can be applied
 // to P safely. This is a sufficient but not necessary condition. We check all
 // the transitive users of P to see if we can find a user that may cause an
 // exception to the situation. If such a user is not found, we conclude that P
@@ -3362,7 +3300,7 @@ namespace {
 // block.
 //
 // TODO(bixia): In order to extend this for kInput fusion, that is reduction
-// with tranpose, we only need to end the use-chain checking with the input of
+// with transpose, we only need to end the use-chain checking with the input of
 // a reduce operations. In this case, the above description on "output" apply
 // to the result of such a use-chain, which provides the input to the reduce
 // operation.
@@ -3394,9 +3332,9 @@ bool IsInstructionSafeForShmemTranspose(const HloInstruction* hlo) {
   }
 }
 
-// Given a group of input parameters that are 0-2-1 tranpose of the outputs of
+// Given a group of input parameters that are 0-2-1 transpose of the outputs of
 // a fusion kernel, returns the input parameters that are safe for the shared
-// memory tranpose implementation.
+// memory transpose implementation.
 //
 // When a tile based shared memory transpose is used to implement an input with
 // 0-2-1 transpose, we preload a tile of the input elements
@@ -3414,8 +3352,7 @@ std::vector<int64> FilterInputsForShmemTranspose(const HloInstruction* fusion,
     if (IsInstructionSafeForShmemTranspose(input)) {
       filtered_input_ids.push_back(input_ids[i]);
     } else {
-      VLOG(10) << "Input not safe for shmem transpose " << input->ToString()
-               << "\n";
+      VLOG(10) << "Input not safe for shmem transpose " << input->ToString();
     }
   }
   return filtered_input_ids;
@@ -3770,13 +3707,13 @@ Status IrEmitterUnnested::EmitReductionFromOrToContiguousDimensions(
         EmitEpilogueForReduction(hlo, kernel_info);
       });
 
-  LaunchDimensions launch_dimensions =
-      EmitKernel(unnested_hlo, {}, kernel_generator, &reduction_info);
+  LaunchDimensions launch_dimensions = EmitKernel(
+      unnested_hlo, /*param_ids=*/{}, kernel_generator, &reduction_info);
   UpdateLaunchDimensions(launch_dimensions, kernel_thunk.get(),
                          ir_emitter_context_->llvm_module());
 
   thunks.push_back(std::move(kernel_thunk));
-  std::unique_ptr<SequentialThunk> sequential_thunk =
+  auto sequential_thunk =
       absl::make_unique<SequentialThunk>(std::move(thunks), unnested_hlo);
   AddThunkToThunkSequence(std::move(sequential_thunk));
 
@@ -3811,11 +3748,16 @@ Status IrEmitterUnnested::EmitConstantGlobals() {
     //
     // We may have to be more more clever here in the future if we notice that
     // we're keeping around too many globals because of their linkage.
+    unsigned global_address_space = llvm_ir::GetGlobalMemoryAddressSpace(
+        *ir_emitter_context_->llvm_module());
     llvm::GlobalVariable* global_for_const = new llvm::GlobalVariable(
         global_type, /*isConstant=*/should_emit_initializer,
         llvm::GlobalValue::ExternalLinkage,
         /*Initializer=*/initializer,
-        llvm_ir::ConstantBufferAllocationToGlobalName(allocation));
+        llvm_ir::ConstantBufferAllocationToGlobalName(allocation),
+        /*TLMode=*/llvm::GlobalValue::NotThreadLocal,
+        /*AddressSpace=*/global_address_space,
+        /*isExternallyInitialized=*/false);
     global_for_const->setAlignment(kConstantBufferAlignBytes);
     ir_emitter_context_->llvm_module()->getGlobalList().push_back(
         global_for_const);

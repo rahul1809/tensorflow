@@ -27,6 +27,7 @@ limitations under the License.
 #include "tensorflow/lite/delegates/gpu/common/types.h"
 #include "tensorflow/lite/delegates/gpu/common/util.h"
 #include "tensorflow/lite/delegates/gpu/gl/node_shader.h"
+#include "tensorflow/lite/delegates/gpu/gl/variable.h"
 #include "tensorflow/lite/delegates/gpu/gl/workgroups/ideal_workgroup_picker.h"
 
 namespace tflite {
@@ -50,7 +51,7 @@ class Convolution : public NodeShader {
                              h * attr.dilations.h - attr.padding.prepended.h);
       }
     }
-    std::vector<UniformParameter> parameters = {
+    std::vector<Variable> parameters = {
         {"input_data_0_h", input->tensor.shape.h},
         {"input_data_0_w", input->tensor.shape.w},
         {"offsets_count", offsets_count},
@@ -104,6 +105,7 @@ class Convolution : public NodeShader {
     *generated_code = {
         /*parameters=*/std::move(parameters),
         /*objects=*/std::move(objects),
+        /*shared_variables=*/{},
         /*workload=*/uint3(),
         /*workgroup=*/
         GetIdealWorkgroupIfPossible(
@@ -158,7 +160,7 @@ class Convolution1x1 : public NodeShader {
 
     int multiplier = SelectMultiplier(input->tensor.shape.w, ctx);
 
-    std::vector<UniformParameter> parameters = {
+    std::vector<Variable> parameters = {
         {"src_depth", IntegralDivideRoundUp(input->tensor.shape.c, 4)},
     };
 
@@ -240,6 +242,7 @@ class Convolution1x1 : public NodeShader {
     *generated_code = {
         /*parameters=*/std::move(parameters),
         /*objects=*/std::move(objects),
+        /*shared_variables=*/{},
         /*workload=*/
         uint3(output->tensor.shape.w / multiplier, output->tensor.shape.h,
               IntegralDivideRoundUp(output->tensor.shape.c, 4)),

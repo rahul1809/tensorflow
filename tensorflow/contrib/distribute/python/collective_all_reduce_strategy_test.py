@@ -115,7 +115,7 @@ class CollectiveAllReduceStrategyTestBase(
   def setUp(self):
     # We use a different key_base for each test so that collective keys won't be
     # reused.
-    # TODO(yuefengz, tucker): enable it to reuse collective keys in different
+    # TODO(yuefengz, ayushd): enable it to reuse collective keys in different
     # tests.
     CollectiveAllReduceStrategyTestBase.collective_key_base += 100000
     super(CollectiveAllReduceStrategyTestBase, self).setUp()
@@ -133,11 +133,11 @@ class CollectiveAllReduceStrategyTestBase(
         use_core_strategy=use_core_strategy)
 
     collective_keys = cross_device_utils.CollectiveKeys(
-        group_key_start=10 * num_gpus +
+        group_key_start=10 +
         CollectiveAllReduceStrategyTestBase.collective_key_base,
-        instance_key_start=num_gpus * 100 +
+        op_instance_key_start=100 +
         CollectiveAllReduceStrategyTestBase.collective_key_base,
-        instance_key_with_id_start=num_gpus * 10000 +
+        variable_instance_key_start=10000 +
         CollectiveAllReduceStrategyTestBase.collective_key_base)
     strategy.extended._collective_keys = collective_keys
     strategy.extended._cross_device_ops._collective_keys = (collective_keys)
@@ -214,7 +214,6 @@ class CollectiveAllReduceStrategyTestBase(
       error_after = abs(after - 1)
       # Error should go down
       self.assertLess(error_after, error_before)
-      return error_after < error_before
 
   def _test_complex_model(self,
                           task_type,
@@ -270,7 +269,6 @@ class CollectiveAllReduceStrategyTestBase(
 
       sess.run(variables.global_variables_initializer())
       sess.run(train_op)
-      return True
 
   def _test_variable_initialization(self,
                                     task_type,
@@ -303,7 +301,6 @@ class CollectiveAllReduceStrategyTestBase(
           np.allclose(x_value, reduced_x_value, atol=1e-5),
           msg=('x_value = %r, reduced_x_value = %r' % (x_value,
                                                        reduced_x_value)))
-    return np.allclose(x_value, reduced_x_value, atol=1e-5)
 
   def _test_input_fn_iterator(self,
                               task_type,
@@ -498,8 +495,13 @@ class DistributedCollectiveAllReduceStrategyTest(
       self.assertEqual('grpc', server_def.protocol)
       mock_called[0] = True
 
+    def mock_configure_collective_ops(*args, **kwargs):
+      del args, kwargs
+
     with test.mock.patch.object(context.context(), 'enable_collective_ops',
-                                mock_enable_collective_ops):
+                                mock_enable_collective_ops), \
+         test.mock.patch.object(context.context(), 'configure_collective_ops',
+                                mock_configure_collective_ops):
       strategy, _, _ = self._get_test_object(
           task_type='worker', task_id=1, num_gpus=2, use_core_strategy=True)
     self.assertTrue(strategy.extended._std_server_started)

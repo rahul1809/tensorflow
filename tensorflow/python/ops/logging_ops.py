@@ -18,13 +18,16 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import os
 import pprint
 import random
 import sys
 
+from absl import logging
 import six
 
 from tensorflow.python import pywrap_tensorflow
+from tensorflow.python.compat import compat
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import sparse_tensor
@@ -67,21 +70,7 @@ except NameError:
             "directly specified in session.run or used as a "
             "control dependency for other operators. This is "
             "only a concern in graph mode. Below is an example "
-            "of how to ensure tf.print executes in graph mode:\n"
-            """```python
-    sess = tf.compat.v1.Session()
-    with sess.as_default():
-        tensor = tf.range(10)
-        print_op = tf.print(tensor)
-        with tf.control_dependencies([print_op]):
-          out = tf.add(tensor, tensor)
-        sess.run(out)
-    ```
-Additionally, to use tf.print in python 2.7, users must make sure to import
-the following:
-
-  `from __future__ import print_function`
-""")
+            "of how to ensure tf.print executes in graph mode:\n")
 @tf_export(v1=["Print"])
 def Print(input_, data, message=None, first_n=None, summarize=None, name=None):
   """Prints a list of tensors.
@@ -105,6 +94,20 @@ def Print(input_, data, message=None, first_n=None, summarize=None, name=None):
 
   Returns:
     A `Tensor`. Has the same type and contents as `input_`.
+
+  	```python
+    sess = tf.compat.v1.Session()
+    with sess.as_default():
+        tensor = tf.range(10)
+        print_op = tf.print(tensor)
+        with tf.control_dependencies([print_op]):
+          out = tf.add(tensor, tensor)
+        sess.run(out)
+  	```
+	Additionally, to use tf.print in python 2.7, users must make sure to import
+	the following:
+
+  `from __future__ import print_function`
   """
   return gen_logging_ops._print(input_, data, message, first_n, summarize, name)
 
@@ -156,23 +159,28 @@ def print_v2(*inputs, **kwargs):
 
   Example:
     Single-input usage:
+
     ```python
     tf.compat.v1.enable_eager_execution()
     tensor = tf.range(10)
     tf.print(tensor, output_stream=sys.stderr)
     ```
+
     (This prints "[0 1 2 ... 7 8 9]" to sys.stderr)
 
     Multi-input usage:
+
     ```python
     tf.compat.v1.enable_eager_execution()
     tensor = tf.range(10)
     tf.print("tensors:", tensor, {2: tensor * 2}, output_stream=sys.stdout)
     ```
+
     (This prints "tensors: [0 1 2 ... 7 8 9] {2: [0 2 4 ... 14 16 18]}" to
     sys.stdout)
 
     Usage in a defun:
+
     ```python
     tf.compat.v1.enable_eager_execution()
 
@@ -184,9 +192,11 @@ def print_v2(*inputs, **kwargs):
 
     range_tensor = f()
     ```
+
     (This prints "[0 1 2 ... 7 8 9]" to sys.stderr)
 
     Usage when constructing graphs:
+
     ```python
     sess = tf.compat.v1.Session()
     with sess.as_default():
@@ -197,6 +207,7 @@ def print_v2(*inputs, **kwargs):
           tripled_tensor = tensor * 3
         sess.run(tripled_tensor)
     ```
+
     (This prints "tensors: [0 1 2 ... 7 8 9] {2: [0 2 4 ... 14 16 18]}" to
     sys.stdout)
 
@@ -211,14 +222,17 @@ def print_v2(*inputs, **kwargs):
       ways), and printable python objects.
     output_stream: The output stream, logging level, or file to print to.
       Defaults to sys.stderr, but sys.stdout, tf.compat.v1.logging.info,
-      tf.compat.v1.logging.warning, and tf.compat.v1.logging.error are also
-      supported. To print to
-      a file, pass a string started with "file://" followed by the file path,
-      e.g., "file:///tmp/foo.out".
+      tf.compat.v1.logging.warning, tf.compat.v1.logging.error,
+      absl.logging.info, absl.logging.warning and absl.loogging,error are also
+      supported. To print to a file, pass a string started with "file://"
+      followed by the file path, e.g., "file:///tmp/foo.out".
     summarize: The first and last `summarize` elements within each dimension are
       recursively printed per Tensor. If None, then the first 3 and last 3
       elements of each dimension are printed for each tensor. If set to -1, it
       will print all elements of every tensor.
+    sep: The string to use to separate the inputs. Defaults to " ".
+    end: End character that is appended at the end the printed string.
+      Defaults to the newline character.
     name: A name for the operation (optional).
 
   Returns:
@@ -235,6 +249,8 @@ def print_v2(*inputs, **kwargs):
   output_stream = kwargs.pop("output_stream", sys.stderr)
   name = kwargs.pop("name", None)
   summarize = kwargs.pop("summarize", 3)
+  sep = kwargs.pop("sep", " ")
+  end = kwargs.pop("end", os.linesep)
   if kwargs:
     raise ValueError("Unrecognized keyword arguments for tf.print: %s" % kwargs)
   format_name = None
@@ -253,6 +269,15 @@ def print_v2(*inputs, **kwargs):
       tf_logging.warn: "log(warning)",
       tf_logging.ERROR: "log(error)",
       tf_logging.error: "log(error)",
+      logging.INFO: "log(info)",
+      logging.info: "log(info)",
+      logging.INFO: "log(info)",
+      logging.WARNING: "log(warning)",
+      logging.WARN: "log(warning)",
+      logging.warning: "log(warning)",
+      logging.warn: "log(warning)",
+      logging.ERROR: "log(error)",
+      logging.error: "log(error)",
   }
 
   if _is_filepath(output_stream):
@@ -329,7 +354,7 @@ def print_v2(*inputs, **kwargs):
     # the formatted/printed output will not contain quotes around tensors.
     # (example of where these quotes might appear: if we have added a
     # placeholder string into a list, then pretty-formatted that list)
-    template = " ".join(templates)
+    template = sep.join(templates)
     template = template.replace("'" + placeholder + "'", placeholder)
     formatted_string = string_ops.string_format(
         inputs=tensors,
@@ -338,9 +363,15 @@ def print_v2(*inputs, **kwargs):
         summarize=summarize,
         name=format_name)
 
-  return gen_logging_ops.print_v2(
-      formatted_string, output_stream=output_stream_string, name=name)
-
+  if compat.forward_compatible(2019, 5, 27):
+    return gen_logging_ops.print_v2(
+        formatted_string, output_stream=output_stream_string, name=name,
+        end=end)
+  else:
+    if end == os.linesep:
+      end = ""
+    return gen_logging_ops.print_v2(
+        formatted_string + end, output_stream=output_stream_string, name=name)
 
 # pylint: enable=g-doc-args
 
